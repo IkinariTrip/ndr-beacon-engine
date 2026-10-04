@@ -206,6 +206,8 @@ def analyze_pcap(pcap_path, model_path=DEFAULT_MODEL, threshold=None, keep_work_
         stats["n_biflows"] = 0 if biflows is None else len(biflows)
         flows = to_north_south(biflows)
         stats["n_north_south_flows"] = len(flows)
+        sizes = flows.groupby(PAIR_KEYS).size() if len(flows) else []
+        stats["n_filtered_pairs"] = int((sizes < MIN_PAIR_FLOWS).sum()) if len(flows) else 0
         blocks = build_blocks(flows)
         stats["n_pairs"] = 0 if len(blocks) == 0 else int(blocks.groupby(PAIR_KEYS).ngroups)
         stats["n_blocks"] = len(blocks)
