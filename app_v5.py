@@ -1,15 +1,15 @@
 """
-app_v5.py
+app_v5.py（v5.1：エンジンAに水平スキャン検知を追加）
 【仮称】インシデンス・コックピット改5：エンジンA（内部探索）×エンジンB（外部C2）の並列デュアル構成。
-リポジトリ直下に配置し、streamlit run app_v5.py で起動する。app_v4.py は残したまま使える。
+リポジトリ直下に配置し、streamlit run app_v5.py で起動する。
 
-app_v4.py からの変更点:
-  1. 解析ボタン押下時に、エンジンAとエンジンBを両方実行する（エンジンAの計算処理はapp_v4と同一）
-  2. 結果を st.session_state に保存する
-     → しきい値スライダーや展開ボタンを操作しても、結果が消えず、再解析も起きない
-  3. 画面を3タブ構成にする：🧭 統合判定 ／ 🔍 エンジンA ／ 📡 エンジンB
-  4. 相関判定（仕様 Phase D）：同じIPが「スキャン判定（A）」と「C2 CRITICAL/WARNING（B）」の
-     両方に該当した場合、最優先の侵害端末（即時隔離の検討対象）として表示する
+v5.0 からの変更点:
+  - エンジンAの計算を src/engine_a/features.py に移した（既存8特徴量の計算は変更なし）
+  - エンジンAに「水平スキャン」判定を追加
+      縦スキャン ：既存の CatBoost v4（1台の相手に多数のポート）
+      水平スキャン：新しいルール（同じポートを毎回違う相手に試し、ほぼ応答なし）
+    どちらかに該当すればエンジンAの「スキャン」とし、種別を表示する
+  - 相関判定は、縦・水平どちらのスキャンでもエンジンAの該当として扱う
 """
 import os
 import sys
@@ -18,12 +18,12 @@ import tempfile
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.stats import entropy
 import streamlit as st
 
 from src.flow_generator import extract_flows_from_pcap
+from src.engine_a.features import (flows_to_dataframe, build_blocks, horizontal_scan_flags,
+                                   VERTICAL_FEATURES, H_RULE)
 
-# エンジンBのモジュール（src/engine_b/ 内は相互に平置きのimportを使うため、パスを先頭に追加）
 ENGINE_B_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "engine_b")
 if ENGINE_B_DIR not in sys.path:
     sys.path.insert(0, ENGINE_B_DIR)
@@ -32,7 +32,8 @@ from engine_b_view import render_engine_b_results, triage_pairs  # noqa: E402
 
 st.set_page_config(page_title="【仮称】インシデンス・コックピット改5", page_icon="🛡️", layout="wide")
 st.title("🛡️ 【仮称】インシデンス・コックピット改5（デュアルエンジン版）")
-st.caption("エンジンA：内部ポートスキャン検知（CatBoost v4）／エンジンB：外部C2ビーコン検知（CatBoost・タイミング5特徴量）")
+st.caption("エンジンA：内部ポートスキャン検知（縦：CatBoost v4／水平：ルール）／"
+           "エンジンB：外部C2ビーコン検知（CatBoost・タイミング5特徴量）")
 
 MODEL_PATH = "models/model_catboost_v4.joblib"
 
@@ -55,110 +56,56 @@ if model is None:
 with st.sidebar:
     st.header("⚙️ 監視パラメータ")
     st.subheader("エンジンA（内部スキャン）")
-    threshold = st.slider("異常判定しきい値", 0.1, 0.9, 0.5, step=0.05)
+    threshold = st.slider("縦スキャン：異常判定しきい値", 0.1, 0.9, 0.5, step=0.05)
     window_size = st.number_input("時間窓ブロックサイズ (フロー数)", min_value=5, max_value=100, value=25)
     st.caption("ブロックサイズの変更は、解析を再実行すると反映されます")
+    use_h = st.checkbox("水平スキャン判定を有効にする", value=True)
+    st.caption(f"水平スキャン：宛先IPの重複なし率≥{H_RULE['ip_ratio']}、同一ポート率≥{H_RULE['port_share']}、"
+               f"応答データなし率≥{H_RULE['no_return']}")
     st.markdown("---")
     st.subheader("エンジンB（外部C2）")
     st.caption("4段階トリアージ：CRITICAL ≥0.85／WARNING／SAFE <0.35／FILTERED（通信10回未満）")
     st.markdown("---")
     st.markdown("""
 **【改5】構成:**
-- **エンジンA:** 空間（宛先ポートの散らばり）からスキャンを検知
+- **エンジンA:** 空間（宛先ポート・宛先IPの散らばり）からスキャンを検知
 - **エンジンB:** 時間（通信間隔のリズム）からC2を検知
 - **相関判定:** 両方に該当する端末を最優先で提示
 """)
 
 
-def calculate_entropy(series):
-    counts = series.value_counts()
-    return float(entropy(counts)) if len(counts) > 1 else 0.0
-
-
-# ---------------------------------------------------------------------------
-# エンジンA：app_v4.py の処理をそのまま関数化（計算内容は一切変更していない）
-# ---------------------------------------------------------------------------
 def run_engine_a(pcap_path, window_size):
     flows, total_pkts = extract_flows_from_pcap(pcap_path)
     if not flows:
         return None, None, total_pkts
-
-    flow_records = []
-    for flow in flows:
-        pkts = getattr(flow, "packets", [])
-        if not pkts:
-            continue
-        times = [p[0] for p in pkts]
-        lengths = [p[1] for p in pkts]
-        directions = [p[2] for p in pkts]
-        flags = [p[3] for p in pkts]
-
-        fwd_lengths = [l for l, d in zip(lengths, directions) if d == 1]
-        bwd_lengths = [l for l, d in zip(lengths, directions) if d == -1]
-
-        # ヘッダー54バイトを除いた純粋ペイロード長
-        fwd_payload_lengths = [max(0, l - 54) for l in fwd_lengths]
-        bwd_payload_lengths = [max(0, l - 54) for l in bwd_lengths]
-
-        fwd_len_mean = float(np.mean(fwd_payload_lengths)) if fwd_payload_lengths else 0.0
-        bwd_len_mean = float(np.mean(bwd_payload_lengths)) if bwd_payload_lengths else 0.0
-
-        total_fwd = len(fwd_lengths)
-        total_bwd = len(bwd_lengths)
-
-        down_up = float(total_bwd / total_fwd) if total_fwd > 0 else (1.0 if total_bwd > 0 else 0.0)
-        has_syn = 1.0 if any(flg & 0x02 for flg in flags) else 0.0
-        dur = (max(times) - min(times)) * 1e6 if len(times) > 1 else 0.0
-
-        flow_records.append({
-            "Src_IP": flow.src_ip, "Dst_IP": flow.dst_ip,
-            "Src_Port": flow.src_port, "Dst_Port": flow.dst_port,
-            "Flow_Duration": dur, "Fwd_Pkt_Mean": fwd_len_mean, "Bwd_Pkt_Mean": bwd_len_mean,
-            "Total_Fwd_Pkts": total_fwd, "Total_Bwd_Pkts": total_bwd,
-            "Down_Up_Ratio": down_up, "Has_SYN": has_syn,
-        })
-
-    df_flows = pd.DataFrame(flow_records)
+    df_flows = flows_to_dataframe(flows)
     if df_flows.empty:
         return df_flows, None, total_pkts
-
-    agg_blocks = []
-    for src_ip, group in df_flows.groupby("Src_IP"):
-        for i in range(0, len(group), window_size):
-            chunk = group.iloc[i:i + window_size]
-            if len(chunk) == 0:
-                continue
-            agg_blocks.append({
-                "Src_IP": src_ip,
-                "Observed_Flows": len(chunk),
-                "Unique_Dst_Ports": chunk["Dst_Port"].nunique(),
-                "Port_Entropy": calculate_entropy(chunk["Dst_Port"]),
-                "Zero_Payload_Ratio": (chunk["Fwd_Pkt_Mean"] == 0).mean(),
-                "Avg_Flow_Duration": chunk["Flow_Duration"].mean(),
-                "Mean_Bwd_Pkt_Len": chunk["Bwd_Pkt_Mean"].mean(),
-                "Fwd_Bwd_Pkt_Ratio": (chunk["Total_Fwd_Pkts"] /
-                                      (chunk["Total_Fwd_Pkts"] + chunk["Total_Bwd_Pkts"] + 1e-5)).mean(),
-                "Down_Up_Ratio": chunk["Down_Up_Ratio"].mean(),
-                "SYN_Flag_Ratio": chunk["Has_SYN"].mean(),
-            })
-    df_agg = pd.DataFrame(agg_blocks)
-
-    feature_cols = ["Unique_Dst_Ports", "Port_Entropy", "Zero_Payload_Ratio", "Avg_Flow_Duration",
-                    "Mean_Bwd_Pkt_Len", "Fwd_Bwd_Pkt_Ratio", "Down_Up_Ratio", "SYN_Flag_Ratio"]
-    use_cols = trained_features if trained_features else feature_cols
+    df_agg = build_blocks(df_flows, window_size)
+    use_cols = trained_features if trained_features else VERTICAL_FEATURES
     df_agg["Anomaly_Score"] = model.predict_proba(df_agg[use_cols])[:, 1]
     return df_flows, df_agg, total_pkts
 
 
-# ---------------------------------------------------------------------------
-# 相関判定（Phase D）
-# ---------------------------------------------------------------------------
+def engine_a_hits(df_agg, threshold, use_h):
+    """縦スキャン（モデル）・水平スキャン（ルール）の判定を付け、該当ブロックを返す。"""
+    d = df_agg.copy()
+    d["Vertical"] = d["Anomaly_Score"] >= threshold
+    d["Horizontal"] = horizontal_scan_flags(d) if use_h else False
+    d["Scan_Type"] = np.select([d["Vertical"] & d["Horizontal"], d["Vertical"], d["Horizontal"]],
+                               ["縦＋水平", "縦スキャン", "水平スキャン"], default="")
+    return d, d[d["Vertical"] | d["Horizontal"]]
+
+
 def correlate(attack_blocks, pairs_b):
-    """IPごとに、エンジンAのスキャン判定とエンジンBのC2判定を突き合わせる。"""
-    a = (attack_blocks.groupby("Src_IP")
-         .agg(A_max_score=("Anomaly_Score", "max"), A_scan_blocks=("Anomaly_Score", "size"))
-         .reset_index().rename(columns={"Src_IP": "ip"})) if len(attack_blocks) else \
-        pd.DataFrame(columns=["ip", "A_max_score", "A_scan_blocks"])
+    if len(attack_blocks):
+        a = (attack_blocks.groupby("Src_IP")
+             .agg(A_type=("Scan_Type", lambda s: "／".join(sorted(set(s)))),
+                  A_max_score=("Anomaly_Score", "max"), A_scan_blocks=("Scan_Type", "size"),
+                  A_ports=("Top_Dst_Port", lambda s: ", ".join(map(str, pd.Series(s).value_counts().index[:3]))))
+             .reset_index().rename(columns={"Src_IP": "ip"}))
+    else:
+        a = pd.DataFrame(columns=["ip", "A_type", "A_max_score", "A_scan_blocks", "A_ports"])
 
     if len(pairs_b):
         alert_b = pairs_b[pairs_b["level"].isin(["CRITICAL", "WARNING"])].copy()
@@ -173,16 +120,13 @@ def correlate(attack_blocks, pairs_b):
         b = pd.DataFrame(columns=["ip", "B_level", "B_max_c2", "B_c2_peers"])
 
     m = a.merge(b, on="ip", how="outer")
-    in_a, in_b = m["A_max_score"].notna(), m["B_level"].notna()
+    in_a, in_b = m["A_type"].notna(), m["B_level"].notna()
     m["priority"] = np.select([in_a & in_b, in_b & (m["B_level"] == "CRITICAL"), in_b, in_a],
                               ["① 最優先（スキャン＋C2）", "② C2の疑い（CRITICAL）",
                                "③ C2の疑い（WARNING）", "④ スキャンのみ"], default="")
-    return m.sort_values(["priority", "B_max_c2", "A_max_score"], ascending=[True, False, False]).reset_index(drop=True)
+    return m.sort_values(["priority", "B_max_c2", "A_scan_blocks"], ascending=[True, False, False]).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# 画面
-# ---------------------------------------------------------------------------
 uploaded_file = st.file_uploader("解析対象のパケットキャプチャ (PCAP / PCAPNG) を選択", type=["pcap", "pcapng"])
 
 if uploaded_file is not None:
@@ -198,7 +142,7 @@ if uploaded_file is not None:
             with st.spinner("エンジンB：通信ペア化・C2判定中…（数十秒〜数分）"):
                 try:
                     result["B"] = analyze_pcap(tmp_pcap_path, model_path=ENGINE_B_MODEL)
-                except Exception as e:  # tshark未導入など。エンジンAの結果は表示する
+                except Exception as e:
                     result["B_error"] = f"{type(e).__name__}: {e}"
         finally:
             if os.path.exists(tmp_pcap_path):
@@ -209,7 +153,10 @@ res = st.session_state.get("result")
 if res:
     df_flows, df_agg, total_pkts = res["A"]
     has_a = df_agg is not None and len(df_agg) > 0
-    attack_blocks = df_agg[df_agg["Anomaly_Score"] >= threshold] if has_a else pd.DataFrame()
+    if has_a:
+        df_agg, attack_blocks = engine_a_hits(df_agg, threshold, use_h)
+    else:
+        attack_blocks = pd.DataFrame()
 
     has_b = "B" in res
     if has_b:
@@ -221,7 +168,6 @@ if res:
     st.success(f"解析完了：{res['name']}（エンジンAブロックサイズ {res['window_size']}）")
     tab_all, tab_a, tab_b = st.tabs(["🧭 統合判定", "🔍 エンジンA：内部スキャン", "📡 エンジンB：外部C2"])
 
-    # ---------------- 統合判定 ----------------
     with tab_all:
         corr = correlate(attack_blocks, pairs_b)
         top = corr[corr["priority"].str.startswith("①")]
@@ -232,7 +178,7 @@ if res:
         c[3].metric("① 最優先端末", f"{len(top)} 台")
 
         if len(top):
-            st.error("🚨 **最優先の侵害端末（内部スキャンと外部C2の両方に該当）：" + "、".join(top["ip"]) +
+            st.error("🚨 **最優先の侵害端末（スキャンと外部C2の両方に該当）：" + "、".join(top["ip"]) +
                      "**　→ 即時隔離を検討してください")
         elif len(corr):
             st.warning("両エンジンに同時に該当する端末はありません。下表の優先度順に確認してください。")
@@ -242,46 +188,54 @@ if res:
             st.warning(f"エンジンBは実行できませんでした（{res.get('B_error', '不明')}）。相関判定はエンジンAのみです。")
 
         if len(corr):
-            show = corr[["priority", "ip", "A_max_score", "A_scan_blocks", "B_level", "B_max_c2", "B_c2_peers"]]
+            show = corr[["priority", "ip", "A_type", "A_scan_blocks", "A_ports", "B_level", "B_max_c2", "B_c2_peers"]]
             st.dataframe(show.rename(columns={
-                "priority": "優先度", "ip": "端末IP", "A_max_score": "A：最大スキャンスコア",
-                "A_scan_blocks": "A：異常ブロック数", "B_level": "B：区分", "B_max_c2": "B：最大C2確率",
+                "priority": "優先度", "ip": "端末IP", "A_type": "A：スキャン種別", "A_scan_blocks": "A：該当ブロック数",
+                "A_ports": "A：主な宛先ポート", "B_level": "B：区分", "B_max_c2": "B：最大C2確率",
                 "B_c2_peers": "B：C2の疑いがある相手"}).round(3), hide_index=True)
             if len(top):
                 st.markdown("**Wireshark表示フィルタ（最優先端末の全通信）**")
                 st.code(" || ".join(f"ip.addr == {ip}" for ip in top["ip"]), language="text")
         st.caption("優先度：① 両エンジンに該当 ＞ ② C2 CRITICAL ＞ ③ C2 WARNING ＞ ④ スキャンのみ。"
-                   "エンジンAは通信方向を区別せず送信元IPで判定、エンジンBは社内側IPで判定しています。")
+                   "エンジンAは送信元IP、エンジンBは社内側IPで判定しています。")
 
-    # ---------------- エンジンA ----------------
     with tab_a:
         if not has_a:
             st.warning("有効なTCP/UDPフローが検出されませんでした。")
         else:
-            total_blocks = len(df_agg)
-            attack_ratio = len(attack_blocks) / total_blocks * 100 if total_blocks else 0.0
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("総解析パケット数", f"{total_pkts:,} パック")
             col2.metric("生成フロー数", f"{len(df_flows):,} の流れ")
-            col3.metric("異常行動ブロック数", f"{len(attack_blocks):,} ブロック")
-            col4.metric("異常判定率", f"{attack_ratio:.2f}%")
+            col3.metric("縦スキャン ブロック", f"{int(df_agg['Vertical'].sum()):,}")
+            col4.metric("水平スキャン ブロック", f"{int(df_agg['Horizontal'].sum()):,}")
             st.markdown("---")
             st.subheader("🚨 侵害端末候補スクリーニング結果")
             if not attack_blocks.empty:
-                attacker_ips = attack_blocks["Src_IP"].unique()
-                st.error(f"🚨 **悪意あるスキャン送信元ホストを特定: {', '.join(attacker_ips)}**")
+                for stype, g in attack_blocks.groupby("Scan_Type"):
+                    st.error(f"🚨 **{stype}の送信元: {', '.join(g['Src_IP'].unique())}**")
                 st.write("##### 異常判定ブロック一覧")
-                display_cols = ["Src_IP", "Anomaly_Score", "Unique_Dst_Ports", "Port_Entropy",
-                                "Zero_Payload_Ratio", "SYN_Flag_Ratio", "Mean_Bwd_Pkt_Len", "Observed_Flows"]
-                st.dataframe(attack_blocks[display_cols].sort_values("Anomaly_Score", ascending=False))
+                display_cols = ["Src_IP", "Scan_Type", "Anomaly_Score", "Unique_Dst_Ports", "Unique_Dst_IPs",
+                                "Top_Dst_Port", "Dst_IP_Ratio", "Top_Port_Share", "No_Data_Return_Ratio",
+                                "Zero_Payload_Ratio", "SYN_Flag_Ratio", "Observed_Flows"]
+                st.dataframe(attack_blocks[display_cols].sort_values(["Scan_Type", "Anomaly_Score"],
+                                                                     ascending=[True, False]).round(3))
                 st.write("##### 🔍 調査用 Wireshark フィルタ")
-                st.code(" || ".join(f"ip.src == {ip}" for ip in attacker_ips), language="bash")
+                v_ips = attack_blocks.loc[attack_blocks["Vertical"], "Src_IP"].unique()
+                h = attack_blocks[attack_blocks["Horizontal"]]
+                if len(v_ips):
+                    st.caption("縦スキャン（送信元の全通信）")
+                    st.code(" || ".join(f"ip.src == {ip}" for ip in v_ips), language="bash")
+                if len(h):
+                    st.caption("水平スキャン（送信元 × 主な宛先ポート、SYNのみ）")
+                    pairs = h.groupby("Src_IP")["Top_Dst_Port"].agg(lambda s: sorted(set(s))[:3])
+                    st.code(" || ".join(f"(ip.src == {ip} && tcp.dstport in {{{' '.join(map(str, ps))}}} && "
+                                        f"tcp.flags.syn == 1 && tcp.flags.ack == 0)" for ip, ps in pairs.items()),
+                            language="bash")
             else:
-                st.info("指定されたしきい値を超える不審なスキャン行動は検出されませんでした。")
+                st.info("縦スキャン・水平スキャンとも、該当する行動は検出されませんでした。")
             with st.expander("📊 全ホストの行動集約特徴量を展開"):
                 st.dataframe(df_agg)
 
-    # ---------------- エンジンB ----------------
     with tab_b:
         if has_b:
             render_engine_b_results(summary_b, blocks_b, stats_b, ENGINE_B_MODEL, res["name"])
