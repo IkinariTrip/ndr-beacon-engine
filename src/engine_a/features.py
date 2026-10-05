@@ -1,18 +1,23 @@
 """
 src/engine_a/features.py
 エンジンA（内部スキャン検知）の特徴量計算。app_v5.py と評価スクリプトの両方から使う。
-（学習・評価・アプリで計算がずれないよう、計算を1か所にまとめる）
 
 既存の8特徴量（縦スキャン用・CatBoost v4 が学習済み）の計算は、app_v4.py と1行も変えていない。
-今回、水平スキャン検知のための特徴量を4つ追加した（既存モデルには入力しない）。
+水平スキャン用の4特徴量（v5.1）に加え、今回「その他攻撃（フラッド・リフレクション）」の
+ルールベース判定に使う特徴量を追加する（v5.2）。
 
+  [水平スキャン用 v5.1]
   Unique_Dst_IPs        : ブロック内の宛先IPの種類数
-  Dst_IP_Ratio          : 宛先IPの種類数 ÷ フロー数（1に近いほど「毎回違う相手」）
-  Top_Port_Share        : 最も多い宛先ポートの割合（1に近いほど「同じポートばかり」）
-  No_Data_Return_Ratio  : 相手からデータ（ペイロード）が返ってこなかったフローの割合
+  Dst_IP_Ratio          : 宛先IPの種類数 ÷ フロー数
+  Top_Port_Share        : 最も多い宛先ポートの割合
+  No_Data_Return_Ratio  : 相手からデータが返ってこなかったフローの割合
 
-水平スキャン＝「同じポートを、毎回違う相手に試し、ほとんど応答がない」
-  → Dst_IP_Ratio 高 × Top_Port_Share 高 × No_Data_Return_Ratio 高
+  [その他攻撃判定用 v5.2]
+  Block_Duration        : ブロック内の最初と最後のフロー開始時刻の差（秒）
+  Flow_Rate             : Observed_Flows ÷ Block_Duration（フロー/秒）
+  Fwd_Bytes_Total       : ブロック内の送信バイト数の合計（推定）
+  Bwd_Bytes_Total       : ブロック内の受信バイト数の合計（推定）
+  Byte_Amplification_Ratio : Bwd_Bytes_Total ÷ Fwd_Bytes_Total（応答が要求の何倍か）
 """
 import numpy as np
 import pandas as pd
@@ -23,8 +28,9 @@ VERTICAL_FEATURES = [
     "Mean_Bwd_Pkt_Len", "Fwd_Bwd_Pkt_Ratio", "Down_Up_Ratio", "SYN_Flag_Ratio",
 ]
 HORIZONTAL_FEATURES = ["Unique_Dst_IPs", "Dst_IP_Ratio", "Top_Port_Share", "No_Data_Return_Ratio"]
+OTHER_FEATURES = ["Block_Duration", "Flow_Rate", "Fwd_Bytes_Total", "Bwd_Bytes_Total",
+                  "Byte_Amplification_Ratio"]
 
-# 水平スキャン判定の初期値（評価スクリプト eval_engine_a_horizontal.py の結果で見直す）
 H_RULE = dict(min_flows=10, ip_ratio=0.8, port_share=0.8, no_return=0.8)
 
 
@@ -48,7 +54,6 @@ def flows_to_dataframe(flows):
         fwd_lengths = [l for l, d in zip(lengths, directions) if d == 1]
         bwd_lengths = [l for l, d in zip(lengths, directions) if d == -1]
 
-        # ヘッダー54バイトを除いた純粋ペイロード長
         fwd_payload_lengths = [max(0, l - 54) for l in fwd_lengths]
         bwd_payload_lengths = [max(0, l - 54) for l in bwd_lengths]
 
@@ -62,13 +67,19 @@ def flows_to_dataframe(flows):
         has_syn = 1.0 if any(flg & 0x02 for flg in flags) else 0.0
         dur = (max(times) - min(times)) * 1e6 if len(times) > 1 else 0.0
 
+        # ブロック単位の増幅率計算用に、フロー全体の送受信バイト（実測合計）も保持する
+        fwd_bytes_total = float(np.sum(fwd_payload_lengths)) if fwd_payload_lengths else 0.0
+        bwd_bytes_total = float(np.sum(bwd_payload_lengths)) if bwd_payload_lengths else 0.0
+
         flow_records.append({
             "Src_IP": flow.src_ip, "Dst_IP": flow.dst_ip,
             "Src_Port": flow.src_port, "Dst_Port": flow.dst_port,
             "Flow_Duration": dur, "Fwd_Pkt_Mean": fwd_len_mean, "Bwd_Pkt_Mean": bwd_len_mean,
             "Total_Fwd_Pkts": total_fwd, "Total_Bwd_Pkts": total_bwd,
             "Down_Up_Ratio": down_up, "Has_SYN": has_syn,
-            "Start_Time": float(min(times)),          # 追加（表示・評価用。特徴量には使わない）
+            "Start_Time": float(min(times)),
+            "End_Time": float(max(times)),
+            "Fwd_Bytes": fwd_bytes_total, "Bwd_Bytes": bwd_bytes_total,
         })
     return pd.DataFrame(flow_records)
 
@@ -82,6 +93,12 @@ def build_blocks(df_flows, window_size):
             if len(chunk) == 0:
                 continue
             n = len(chunk)
+            block_start = float(chunk["Start_Time"].min())
+            block_end = float(chunk["End_Time"].max())
+            duration = max(block_end - block_start, 1e-3)
+            fwd_total = float(chunk["Fwd_Bytes"].sum())
+            bwd_total = float(chunk["Bwd_Bytes"].sum())
+
             agg_blocks.append({
                 "Src_IP": src_ip,
                 "Observed_Flows": n,
@@ -95,14 +112,21 @@ def build_blocks(df_flows, window_size):
                                       (chunk["Total_Fwd_Pkts"] + chunk["Total_Bwd_Pkts"] + 1e-5)).mean(),
                 "Down_Up_Ratio": chunk["Down_Up_Ratio"].mean(),
                 "SYN_Flag_Ratio": chunk["Has_SYN"].mean(),
-                # ---- 追加：水平スキャン用の4特徴量 ----
+                # ---- 水平スキャン用の4特徴量（v5.1）----
                 "Unique_Dst_IPs": chunk["Dst_IP"].nunique(),
                 "Dst_IP_Ratio": chunk["Dst_IP"].nunique() / n,
                 "Top_Port_Share": chunk["Dst_Port"].value_counts().iloc[0] / n,
                 "No_Data_Return_Ratio": (chunk["Bwd_Pkt_Mean"] == 0).mean(),
                 "Top_Dst_Port": int(chunk["Dst_Port"].value_counts().index[0]),
-                "Block_Start": float(chunk["Start_Time"].min()) if "Start_Time" in chunk else np.nan,
-                "Block_End": float(chunk["Start_Time"].max()) if "Start_Time" in chunk else np.nan,
+                "Top_Dst_IP": chunk["Dst_IP"].value_counts().index[0],
+                "Block_Start": block_start,
+                "Block_End": block_end,
+                # ---- その他攻撃判定用（v5.2）----
+                "Block_Duration": duration,
+                "Flow_Rate": n / duration,
+                "Fwd_Bytes_Total": fwd_total,
+                "Bwd_Bytes_Total": bwd_total,
+                "Byte_Amplification_Ratio": bwd_total / max(fwd_total, 1.0),
             })
     return pd.DataFrame(agg_blocks)
 

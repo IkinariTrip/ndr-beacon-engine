@@ -1,13 +1,6 @@
 """
-engine_b_view.py（v3：統合アプリ対応）
+engine_b_view.py（v5.2：C2フィルタに周期性・応答有無チェックを追加）
 エンジンB（C2ビーコン検知）の結果画面。src/engine_b/ に配置する。
-
-v2からの変更点:
-  - 解析と表示を分離した。app_v5.py は「解析ボタン押下時に1回だけ analyze_pcap を実行 →
-    結果を st.session_state に保存 → render_engine_b_results で表示」という流れで使う。
-    （v2の render_engine_b はPCAPのパスを受け取って内部で解析していたが、
-     アプリ側では解析後に一時ファイルを削除するため、パス経由の再解析ができない）
-  - render_engine_b(pcap_path) は単体利用のために残している。
 """
 import os
 import sys
@@ -19,7 +12,7 @@ if _THIS_DIR not in sys.path:
 import streamlit as st
 
 from inference import analyze_pcap, load_model, DEFAULT_MODEL
-from triage import apply_triage, top_reasons, CRITICAL_TH, SAFE_TH
+from triage import apply_triage, top_reasons, enrich_c2_filters, CRITICAL_TH, SAFE_TH
 
 LEVEL_ICON = {"CRITICAL": "🔴", "WARNING": "🟠", "SAFE": "🟢", "FILTERED": "⚪"}
 PAIR_KEYS = ["host_ip", "peer_ip", "peer_port", "proto"]
@@ -31,13 +24,12 @@ def _model(model_path):
 
 
 def triage_pairs(summary, stats):
-    """ペア単位の判定結果に4段階トリアージを付ける（アプリの相関判定でも使う）。"""
     return apply_triage(summary, stats.get("n_filtered_pairs", 0))
 
 
 def render_engine_b_results(summary, blocks, stats, model_path=DEFAULT_MODEL, pcap_name="pcap"):
     st.caption(f"通信間隔・接続回数のリズムから、C2サーバーへの定期通信の疑いを判定します"
-               f"（CatBoost・タイミング系5特徴量／CRITICAL ≥{CRITICAL_TH}、SAFE <{SAFE_TH}）")
+               f"（CatBoost・タイミング5特徴量／CRITICAL ≥{CRITICAL_TH}、SAFE <{SAFE_TH}）")
     pairs, counts = triage_pairs(summary, stats)
 
     c = st.columns(4)
@@ -48,7 +40,14 @@ def render_engine_b_results(summary, blocks, stats, model_path=DEFAULT_MODEL, pc
 
     alerts = pairs[pairs["level"].isin(["CRITICAL", "WARNING"])] if len(pairs) else pairs
     if len(alerts):
-        reason_map = {}
+        reason_map, repr_block = {}, {}
+        # 代表ブロック（フィルタの具体値に使う）はモデル読込とは独立に、必ず取得する
+        try:
+            for key, g in blocks.groupby(PAIR_KEYS):
+                repr_block[key] = g.loc[g["c2_proba"].idxmax()]
+        except Exception:
+            pass
+        # 判定根拠（SHAP）はCatBoostが必要なため、失敗しても上の代表ブロック取得には影響させない
         try:
             model, meta = _model(model_path)
             for key, g in blocks.groupby(PAIR_KEYS):
@@ -66,8 +65,15 @@ def render_engine_b_results(summary, blocks, stats, model_path=DEFAULT_MODEL, pc
                 key = (r.host_ip, r.peer_ip, r.peer_port, r.proto)
                 if key in reason_map:
                     st.write(f"判定根拠（C2寄りに効いた特徴量）：{reason_map[key]}")
-                st.markdown("**Wireshark表示フィルタ**（用途に応じてコピー）")
-                for name, f in r.filters.items():
+                filters = r.filters
+                if key in repr_block:
+                    rb = repr_block[key]
+                    filters = enrich_c2_filters(
+                        filters, r.host_ip, r.peer_ip, r.peer_port, r.proto,
+                        iat_median=rb.get("IAT_Median"), iat_mad=rb.get("IAT_MAD"),
+                        byte_ratio_median=rb.get("Byte_Ratio_Median"))
+                st.markdown("**Wireshark表示フィルタ**（用途に応じてコピー。④は②適用後に追記）")
+                for name, f in filters.items():
                     st.caption(name)
                     st.code(f, language="text")
     else:
@@ -87,11 +93,9 @@ def render_engine_b_results(summary, blocks, stats, model_path=DEFAULT_MODEL, pc
     st.caption("注意：本モデルは公開データ（IoT-23のMirai）で学習した原理実証版です。"
                "リズムの異なるC2は見逃す可能性があり、間隔の短い正常通信（NTP・DNS等）を"
                "WARNING／CRITICALとすることがあります。区分は調査の優先順位として使用してください。")
-    return pairs
 
 
 def render_engine_b(pcap_path, model_path=DEFAULT_MODEL):
-    """単体利用向け（PCAPのパスを渡すと解析から表示まで行う）。"""
     st.subheader("エンジンB：外部C2ビーコン通信の検知")
     if not pcap_path or not os.path.exists(pcap_path):
         st.info("PCAPファイルを読み込むと解析を開始します。")

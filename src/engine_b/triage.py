@@ -1,21 +1,14 @@
 """
 triage.py
 エンジンB 判定結果の多段トリアージ（仕様書v2.4 6章・7章、v2.5 6章）。
-src/engine_b/ に配置する。表示（Streamlit）に依存しない純粋な処理だけを置く。
-
-  1. 4段階トリアージ  : CRITICAL / WARNING / SAFE / FILTERED
-  2. 補助IOC照合      : Suspect Port（443/80/53以外で 8080・8888・8443・5555・7777）
-                        ※ 判定レベルは変えず、タグとして表示する
-                        ※ CS Stager照合は、HTTPのURI抽出（tshark項目追加）が必要なため未実装
-  3. Wiresharkフィルタ: 用途別3段階（①ペア全体 ②ペア＋ポート ③ペア＋観測期間）
-  4. 判定根拠        : CatBoost自身のSHAP値（get_feature_importance）で上位2特徴量を出す
+v5.2で、C2のWiresharkフィルタに「周期性の確認用」「応答有無の確認用」の2種類を追加した。
 """
 import numpy as np
 import pandas as pd
 
-CRITICAL_TH = 0.85          # v2.4 6章（v2.5 6章：フェーズA後に再調整予定の暫定値）
+CRITICAL_TH = 0.85
 SAFE_TH = 0.35
-SAFE_MAX_BYTES = 5 * 1024 * 1024   # 5MB
+SAFE_MAX_BYTES = 5 * 1024 * 1024
 EXFIL_BYTES = 5 * 1024 * 1024
 EXFIL_BURST = 0.8
 SUSPECT_PORTS = {8080, 8888, 8443, 5555, 7777}
@@ -29,7 +22,6 @@ FEATURE_JA = {
 
 
 def triage_level(max_proba, total_bytes=None, burst_ratio=None):
-    """1ペアの区分を返す。total_bytes が無い場合はバイト条件を使わない。"""
     has_bytes = total_bytes is not None and not pd.isna(total_bytes)
     if has_bytes and total_bytes >= EXFIL_BYTES and burst_ratio is not None \
             and not pd.isna(burst_ratio) and burst_ratio > EXFIL_BURST:
@@ -49,7 +41,14 @@ def suspect_port(port):
     return port not in STANDARD_PORTS and port in SUSPECT_PORTS
 
 
-def wireshark_filters(host_ip, peer_ip, peer_port, proto, first_epoch, last_epoch):
+def _epoch(x):
+    if isinstance(x, (int, float, np.floating)):
+        return float(x)
+    return pd.Timestamp(x).timestamp()
+
+
+def base_wireshark_filters(host_ip, peer_ip, peer_port, proto, first_epoch, last_epoch):
+    """従来からある3段階（ペア全体／ペア＋ポート／ペア＋観測期間）。"""
     pair = f"ip.addr=={host_ip} && ip.addr=={peer_ip}"
     return {
         "① ペア全体": pair,
@@ -59,10 +58,20 @@ def wireshark_filters(host_ip, peer_ip, peer_port, proto, first_epoch, last_epoc
     }
 
 
-def _epoch(x):
-    if isinstance(x, (int, float, np.floating)):
-        return float(x)
-    return pd.Timestamp(x).timestamp()
+def enrich_c2_filters(base_filters, host_ip, peer_ip, peer_port, proto,
+                      iat_median=None, iat_mad=None, byte_ratio_median=None):
+    """C2疑いペアの代表ブロックの特徴量を使い、調査に役立つフィルタを2つ追加する。"""
+    f = dict(base_filters)
+    pair_port = f"ip.addr=={host_ip} && ip.addr=={peer_ip} && {proto}.port=={int(peer_port)}"
+    if iat_median is not None and not pd.isna(iat_median):
+        mad = iat_mad if (iat_mad is not None and not pd.isna(iat_mad)) else iat_median * 0.2
+        lo, hi = max(iat_median - mad, 0.01), iat_median + mad
+        f[f"④ 周期性の確認用（②適用後に追加。通信間隔 約{iat_median:.1f}秒±{mad:.1f}秒）"] = \
+            f"{pair_port} && frame.time_delta_displayed>={lo:.2f} && frame.time_delta_displayed<={hi:.2f}"
+    if byte_ratio_median is not None and not pd.isna(byte_ratio_median):
+        f[f"⑤ 応答の有無を確認（送信比率 約{byte_ratio_median:.0%}。ペイロードありのみ抽出）"] = \
+            f"{pair_port} && tcp.len>0"
+    return f
 
 
 def apply_triage(summary, n_filtered_pairs=0):
@@ -77,8 +86,8 @@ def apply_triage(summary, n_filtered_pairs=0):
         s["level"] = [r[0] for r in res]
         s["level_reason"] = [r[1] for r in res]
         s["suspect_port"] = s["peer_port"].map(suspect_port)
-        s["filters"] = [wireshark_filters(r.host_ip, r.peer_ip, r.peer_port, r.proto,
-                                          _epoch(r.first_seen), _epoch(r.last_seen))
+        s["filters"] = [base_wireshark_filters(r.host_ip, r.peer_ip, r.peer_port, r.proto,
+                                               _epoch(r.first_seen), _epoch(r.last_seen))
                         for r in s.itertuples()]
         s["level"] = pd.Categorical(s["level"], LEVEL_ORDER, ordered=True)
         s = s.sort_values(["level", "max_c2_proba"], ascending=[True, False]).reset_index(drop=True)
