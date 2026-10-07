@@ -19,6 +19,11 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pathlib import Path as _Path
+from PIL import Image as _PILImage
+_APP_ICON_PATH = str(_Path(__file__).resolve().parent / "assets" / "incidence_cockpit_icon.png")
+st.set_page_config(page_title="Incidence Cockpit", page_icon=_PILImage.open(_APP_ICON_PATH), layout="wide")
+
 
 from src.flow_generator import extract_flows_from_pcap
 from src.engine_a.features import (flows_to_dataframe, build_blocks, horizontal_scan_flags,
@@ -35,8 +40,12 @@ if ENGINE_B_DIR not in sys.path:
 from inference import analyze_pcap, DEFAULT_MODEL as ENGINE_B_MODEL  # noqa: E402
 from engine_b_view import render_engine_b_results, triage_pairs  # noqa: E402
 
-st.set_page_config(page_title="【仮称】インシデンス・コックピット改5", page_icon="🛡️", layout="wide")
-st.title("🛡️ 【仮称】インシデンス・コックピット改5（デュアルエンジン版）")
+
+_ic1, _ic2 = st.columns([1, 12])
+with _ic1:
+    st.image(_APP_ICON_PATH, width=64)
+with _ic2:
+    st.title("Incidence Cockpit")
 st.caption("エンジンA：内部スキャン検知（縦：CatBoost v4／水平・その他：ルール）／"
            "エンジンB：外部C2ビーコン検知（CatBoost・タイミング5特徴量）")
 
@@ -120,6 +129,17 @@ def engine_a_hits(df_agg, threshold, use_h, use_other):
     return d, hit
 
 
+def _dos_label(df):
+    """エンジンAのフラッドの疑いと一致して引き下げられたペアに、表示用の注記を付ける。"""
+    if "a_flood_match" in df.columns:
+        m = df["a_flood_match"].fillna(False).astype(bool)
+    elif "level_reason" in df.columns:
+        m = df["level_reason"].astype(str).str.contains("フラッド")
+    else:
+        m = pd.Series(False, index=df.index)
+    return m.map(lambda x: "（DoS疑い・Aと一致）" if x else "")
+
+
 def correlate(attack_blocks, pairs_b):
     if len(attack_blocks):
         a = (attack_blocks.groupby("Src_IP")
@@ -136,6 +156,7 @@ def correlate(attack_blocks, pairs_b):
         alert_b = pairs_b[pairs_b["level"].isin(["CRITICAL", "WARNING"])].copy()
         alert_b["level"] = alert_b["level"].astype(str)
         alert_b["peer"] = alert_b["peer_ip"] + ":" + alert_b["peer_port"].astype(str)
+        alert_b["peer"] = alert_b["peer"] + _dos_label(alert_b)
         b = (alert_b.groupby("host_ip")
              .agg(B_level=("level", lambda s: "CRITICAL" if (s == "CRITICAL").any() else "WARNING"),
                   B_max_c2=("max_c2_proba", "max"),
