@@ -81,7 +81,7 @@ with st.sidebar:
     st.caption(f"フラッド：宛先IP種類≤{FLOOD_RULE['max_dst_ips']}、同一ポート率≥{FLOOD_RULE['port_share']}、"
                f"{FLOOD_RULE['min_rate']:.0f}フロー/秒以上")
     st.caption(f"DDoS着弾：異なる送信元IP≥{DDOS_DEST_RULE['min_src_ips']}件が{DDOS_DEST_RULE['max_window_sec']:.0f}秒以内に集中")
-    st.caption(f"リフレクション：増幅率≥{REFLECTION_RULE['min_amp_ratio']:.0f}倍（DNS/NTP/SSDP等の既知ポート）")
+    st.caption(f"リフレクション：増幅率≥{REFLECTION_RULE.get('min_amp_ratio', 10):.0f}倍、{REFLECTION_RULE.get('min_flow_rate', 1):.0f}フロー/秒以上、社内外の通信（DNS/NTP/SSDP等の既知ポート）")
     st.caption("※ いずれもルールベースの参考表示です。断定ではなく、調査の優先順位付けとして使用してください。")
     st.markdown("---")
     st.subheader("エンジンB（外部C2）")
@@ -179,6 +179,18 @@ def correlate(attack_blocks, pairs_b):
                          ascending=[True, False, False]).reset_index(drop=True)
 
 
+def _dash_table(df):
+    """表示用：欠損値（None/NaN）を「―」にし、数値は見やすく整える。"""
+    import pandas as pd
+    out = df.copy()
+    for c in out.columns:
+        s = out[c]
+        if pd.api.types.is_numeric_dtype(s):
+            out[c] = s.map(lambda v: "―" if pd.isna(v) else (str(int(v)) if float(v).is_integer() else format(v, ".3f")))
+        else:
+            out[c] = s.map(lambda v: "―" if (pd.isna(v) or str(v).strip() == "" or str(v) == "None") else str(v))
+    return out
+
 uploaded_file = st.file_uploader("解析対象のパケットキャプチャ (PCAP / PCAPNG) を選択", type=["pcap", "pcapng"])
 
 if uploaded_file is not None:
@@ -258,7 +270,7 @@ if res:
             st.dataframe(show.rename(columns={
                 "priority": "優先度", "ip": "端末IP", "A_type": "A：種別", "A_blocks": "A：該当ブロック数",
                 "A_ports": "A：主な宛先ポート", "B_level": "B：区分", "B_max_c2": "B：最大C2確率",
-                "B_c2_peers": "B：C2の疑いがある相手"}).round(3), hide_index=True)
+                "B_c2_peers": "B：C2の疑いがある相手"}).pipe(_dash_table), hide_index=True)
             if len(top):
                 st.markdown("**Wireshark表示フィルタ（最優先端末の全通信）**")
                 st.code(" || ".join(f"ip.addr == {ip}" for ip in top["ip"]), language="text")

@@ -56,23 +56,40 @@ def base_wireshark_filters(host_ip, peer_ip, peer_port, proto, first_epoch, last
                               " && frame.time_epoch <= " + format(last_epoch, ".0f"))
     return filters
 
+def _c2_iat_filter(pair_port, proto, iat_median, iat_mad):
+    """通信間隔の確認用フィルタ（ラベルとフィルタ文字列）を返す。
+    間隔がほぼ0秒のときは範囲が逆転しないよう、上限だけの条件にする。"""
+    if iat_median < 0.05:
+        label = "④ 周期性の確認用（②適用後に追加。通信間隔 ほぼ0秒＝連続送信。0.05秒以下のみ表示）"
+        return label, pair_port + " && frame.time_delta_displayed<=0.05"
+    mad = iat_mad if (iat_mad is not None and not pd.isna(iat_mad)) else 0.0
+    mad = max(mad, iat_median * 0.1)  # ばらつきが0でも、幅を持たせる
+    lo = max(iat_median - mad, 0.01)
+    hi = iat_median + mad
+    digits = ".2f" if mad < 1 else ".1f"
+    label = ("④ 周期性の確認用（②適用後に追加。通信間隔 約" + format(iat_median, ".1f") +
+             "秒±" + format(mad, digits) + "秒）")
+    flt = (pair_port + " && frame.time_delta_displayed>=" + format(lo, ".2f") +
+           " && frame.time_delta_displayed<=" + format(hi, ".2f"))
+    return label, flt
+
 def enrich_c2_filters(base_filters, host_ip, peer_ip, peer_port, proto,
                       iat_median=None, iat_mad=None, byte_ratio_median=None):
-    """C2疑いペアの代表ブロックの特徴量を使い、調査に役立つフィルタを2つ追加する。"""
+    """C2疑いペアの代表ブロックの特徴量を使い、調査に役立つフィルタを2つ追加する。
+    ⑤は、TCPなら tcp.len、UDPなら udp.length（ヘッダ8バイトを除く）でペイロードの有無を見る。"""
     result = dict(base_filters)
+    proto = str(proto).strip().lower()
     pair_port = ("ip.addr==" + str(host_ip) + " && ip.addr==" + str(peer_ip) +
-                 " && " + str(proto) + ".port==" + str(int(peer_port)))
+                 " && " + proto + ".port==" + str(int(peer_port)))
     if iat_median is not None and not pd.isna(iat_median):
-        mad = iat_mad if (iat_mad is not None and not pd.isna(iat_mad)) else iat_median * 0.2
-        lo = max(iat_median - mad, 0.01)
-        hi = iat_median + mad
-        label4 = ("④ 周期性の確認用（②適用後に追加。通信間隔 約" + format(iat_median, ".1f") +
-                  "秒±" + format(mad, ".1f") + "秒）")
-        result[label4] = (pair_port + " && frame.time_delta_displayed>=" + format(lo, ".2f") +
-                          " && frame.time_delta_displayed<=" + format(hi, ".2f"))
+        label4, flt4 = _c2_iat_filter(pair_port, proto, float(iat_median), iat_mad)
+        result[label4] = flt4
     if byte_ratio_median is not None and not pd.isna(byte_ratio_median):
         label5 = "⑤ 応答の有無を確認（送信比率 約" + format(byte_ratio_median, ".0%") + "。ペイロードありのみ抽出）"
-        result[label5] = pair_port + " && tcp.len>0"
+        if proto == "udp":
+            result[label5] = pair_port + " && udp.length>8"
+        else:
+            result[label5] = pair_port + " && tcp.len>0"
     return result
 
 def apply_flood_downgrade(s):
