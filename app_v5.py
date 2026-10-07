@@ -24,9 +24,9 @@ from src.flow_generator import extract_flows_from_pcap
 from src.engine_a.features import (flows_to_dataframe, build_blocks, horizontal_scan_flags,
                                    VERTICAL_FEATURES, H_RULE)
 from src.engine_a.other_attacks import (flood_flags, reflection_flags, build_dest_side_blocks,
-                                        ddos_dest_flags, flood_filters, reflection_filters,
-                                        ddos_dest_filters, FLOOD_RULE, DDOS_DEST_RULE,
-                                        REFLECTION_RULE, REFLECTION_PORTS)
+                                        ddos_dest_flags, attach_top_src_ips,
+                                        flood_filters, reflection_filters, ddos_dest_filters,
+                                        FLOOD_RULE, DDOS_DEST_RULE, REFLECTION_RULE, REFLECTION_PORTS)
 from src.engine_a.filters import vertical_filters, horizontal_filters
 
 ENGINE_B_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "engine_b")
@@ -188,8 +188,9 @@ if res:
         df_agg, attack_blocks = engine_a_hits(df_agg, threshold, use_h, use_other)
         dest_hit = (df_dest[ddos_dest_flags(df_dest)] if (df_dest is not None and len(df_dest) and use_other)
                    else pd.DataFrame())
+        dest_hit = attach_top_src_ips(df_flows, dest_hit, int(window_size)) if len(dest_hit) else dest_hit
     else:
-        attack_blocks, dest_hit = pd.DataFrame(), pd.DataFrame()
+        attack_blocks, dest_hit = [], pd.DataFrame()
 
     has_b = "B" in res
     if has_b:
