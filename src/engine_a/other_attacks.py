@@ -1,32 +1,116 @@
+"""
+src/engine_a/other_attacks.py
+エンジンA：ルールベースによる「その他攻撃の疑い」判定（v5.2 新規、v5.3 ベクトル化、v5.4 社外宛て条件）。
+【位置づけ】
+  正解ラベル（Zeek）は実運用では得られないため、ポートスキャン（縦・水平）と同じく
+  フローの統計的な振る舞いだけで判定する。C2・ポートスキャンのどちらにも断定できない
+  通信を、「疑いあり（参考）」として提示し、調査の優先順位付けに使う。
+  仕様書には記載のない拡張機能であり、CRITICAL/WARNINGのような断定的な表現は使わない。
+【検知する3種類】
+  1. フラッド（DoS）の疑い
+       送信元1台が、ごく少数の宛先（1〜2台）の同一ポートに対して、
+       異常に高い頻度で接続を試みている状態。
+  2. 分散アクセス（DDoS着弾）の疑い
+       視点を反転し、1つの宛先IP:ポートに、短時間で非常に多くの
+       異なる送信元IPからアクセスが集中している状態。
+  3. リフレクション/増幅の疑い
+       DNS・NTP・SSDP等、増幅攻撃の踏み台として悪用されやすいポートへの通信で、
+       応答のデータ量が要求のデータ量に対して著しく大きい状態。
+【v5.4 変更点：リフレクションの判定に「宛先が社外」の条件を追加】
+  Echo 5-1（正常通信のみのキャプチャ）で、端末192.168.2.3が自宅ルーター192.168.2.1の
+  DNS（53番ポート）へ問い合わせた1ブロックが、増幅率11.4倍・71,610バイトで
+  リフレクションの疑いと判定された（誤検知）。
+  実際のリフレクション攻撃は、社外の公開サーバーを踏み台にするため、
+  宛先が社内（プライベートIP）・マルチキャスト・ループバック等の場合は対象外とする。
+  社外かどうかの判定は、エンジンB（common.py の is_external）と同じ条件にそろえた。
+  従来の挙動に戻したい場合は、reflection_flags の external_only=False を指定する。
+  なお、フラッド・DDoS着弾の判定には、この条件を入れていない（今回は変更しない）。
+【しきい値の根拠】
+  いずれも初期値であり、実データでの評価を行った上で、必要に応じて見直すことを前提とする。
+【v5.3 変更点：build_dest_side_blocks のベクトル化】
+  旧実装は「宛先IP:ポートごとにgroupby → Pythonのforループでwindow_sizeずつ切り出し →
+  ループ内で value_counts() を呼んで上位送信元IPも同時に計算」という作りだった。
+  水平スキャン型の通信（7-1のMirai等）は宛先IPが毎回異なるため、
+  groupby後のグループ数自体が数十万〜フロー数に近い規模に達し、
+  現実的な時間で終わらなくなった。
+  対策として、以下の2段階に分離した：
+    1. build_dest_side_blocks()：size/nunique/min/max という、pandas内部で
+       完全にベクトル化された集約関数だけを使い、全ブロックの基本統計を一括計算する。
+    2. attach_top_src_ips()：表示用の「上位5送信元IP」は、しきい値を満たした
+       （＝ごく少数に絞られた）ブロックに対してだけ、後から個別に計算する。
+  ループ版（_build_dest_side_blocks_loop）は、結果一致確認のためだけに残してある。
+"""
+import ipaddress
 import numpy as np
 import pandas as pd
 
 FLOOD_RULE = dict(min_flows=10, max_dst_ips=2, port_share=0.9, min_rate=20.0)
 DDOS_DEST_RULE = dict(min_flows=15, min_src_ips=15, max_window_sec=10.0)
 REFLECTION_RULE = dict(min_amp_ratio=10.0, min_bytes=2000.0)
-
 REFLECTION_PORTS = {53: "DNS", 123: "NTP", 1900: "SSDP", 19: "CharGEN",
                     161: "SNMP", 11211: "Memcached", 389: "CLDAP/LDAP", 1434: "MS-SQL"}
 
+def is_external_ip(ip):
+    """社外（グローバル）のIPなら True。
+    社内（プライベート）・マルチキャスト・リンクローカル・ループバック・未指定・
+    ブロードキャストは False。エンジンB（common.py の is_external）と同じ条件。
+    IPアドレスとして読めない値も False とする。"""
+    try:
+        addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return False
+    if addr.is_private or addr.is_multicast or addr.is_link_local:
+        return False
+    if addr.is_loopback or addr.is_unspecified:
+        return False
+    return str(addr) != "255.255.255.255"
+
+def _external_mask(ip_series):
+    """IPアドレスの列から、「社外か」の真偽値の列を作る。
+    同じIPを何度も判定しないよう、種類ごとに1回だけ判定して使い回す。"""
+    cache = {}
+    for ip in ip_series.unique():
+        cache[ip] = is_external_ip(ip)
+    return ip_series.map(cache).fillna(False).astype(bool)
+
 def flood_flags(df_agg, min_flows=None, max_dst_ips=None, port_share=None, min_rate=None):
+    """フラッド（DoS）の疑い：少数の宛先・同一ポートへの高頻度接続。"""
     p = dict(FLOOD_RULE)
     p.update({k: v for k, v in dict(min_flows=min_flows, max_dst_ips=max_dst_ips,
-                                    port_share=port_share, min_rate=min_rate).items() if v is not None})
+                                     port_share=port_share, min_rate=min_rate).items() if v is not None})
     return ((df_agg["Observed_Flows"] >= p["min_flows"]) &
             (df_agg["Unique_Dst_IPs"] <= p["max_dst_ips"]) &
             (df_agg["Top_Port_Share"] >= p["port_share"]) &
             (df_agg["Flow_Rate"] >= p["min_rate"]))
 
-def reflection_flags(df_agg, min_amp_ratio=None, min_bytes=None):
+def reflection_flags(df_agg, min_amp_ratio=None, min_bytes=None, external_only=True):
+    """リフレクション/増幅の疑い：既知の増幅ポートへの、応答過多な通信。
+    external_only=True（既定）のときは、宛先（Top_Dst_IP）が社外のブロックだけを対象にする。"""
     p = dict(REFLECTION_RULE)
     p.update({k: v for k, v in dict(min_amp_ratio=min_amp_ratio, min_bytes=min_bytes).items()
              if v is not None})
     is_reflection_port = df_agg["Top_Dst_Port"].isin(REFLECTION_PORTS.keys())
-    return (is_reflection_port &
+    cand = (is_reflection_port &
             (df_agg["Byte_Amplification_Ratio"] >= p["min_amp_ratio"]) &
             (df_agg["Bwd_Bytes_Total"] >= p["min_bytes"]))
+    flags = cand.copy()
+    if external_only and cand.any():
+        # 条件を満たした少数のブロックだけ、宛先が社外かを確認する（全ブロックは調べない）
+        ips = df_agg.loc[cand, "Top_Dst_IP"]
+        flags.loc[cand] = _external_mask(ips).values
+    return flags
 
 def build_dest_side_blocks(df_flows, window_size):
+    """視点を反転：宛先IP:ポートごとに window_size フローずつ区切り、
+    異なる送信元IPの数を数える（DDoS着弾＝分散アクセスの疑いの検出用）。ベクトル化版。
+    【重要】水平スキャン型の通信（宛先IPがほぼ毎回異なる）では、
+    groupby(["Dst_IP","Dst_Port"]) のグループ数が母数（フロー数）に近い規模まで
+    膨れ上がる。この関数は numpy/pandas の組み込み集約（size/nunique/min/max）
+    だけを使い、グループごとに呼ばれるPython関数（.agg(lambda ...) 等）を
+    一切含まない設計にしている。表示用の「上位5送信元IP」は、ここでは計算せず、
+    attach_top_src_ips() で、しきい値を満たした（＝ごく少数に絞られた）
+    ブロックに対してだけ後から計算する。
+    """
     if df_flows.empty:
         return pd.DataFrame()
     df = df_flows.sort_values(["Dst_IP", "Dst_Port", "Start_Time"], kind="mergesort").reset_index(drop=True)
@@ -49,6 +133,11 @@ def build_dest_side_blocks(df_flows, window_size):
                "Block_Start", "Block_End", "Top_Src_IPs"]]
 
 def attach_top_src_ips(df_flows, dest_blocks, window_size, top_n=5):
+    """build_dest_side_blocks() の結果（通常はしきい値を満たした少数の行に絞った後）に、
+    表示用の「上位送信元IP」を付与する。対象行数が少ないこと（DDoS着弾候補のみ）を
+    前提に、対象ブロックだけをピンポイントで再抽出して計算する。
+    全ブロックに対して行うと build_dest_side_blocks と同じ速度問題が再発するため、
+    必ず ddos_dest_flags() 等で絞り込んだ後の dest_blocks に対して呼び出すこと。"""
     if dest_blocks.empty:
         return dest_blocks
     out = dest_blocks.copy()
@@ -65,6 +154,8 @@ def attach_top_src_ips(df_flows, dest_blocks, window_size, top_n=5):
     return out
 
 def _build_dest_side_blocks_loop(df_flows, window_size):
+    """【検証専用】旧実装（Pythonループ版）。ベクトル化版との結果一致確認のためだけに残す。
+    戻り値には Top_Src_IPs も含む（新実装では attach_top_src_ips と組み合わせて比較する）。"""
     rows = []
     key_cols = ["Dst_IP", "Dst_Port"]
     sorted_df = df_flows.sort_values(key_cols + ["Start_Time"])
@@ -87,9 +178,10 @@ def _build_dest_side_blocks_loop(df_flows, window_size):
     return pd.DataFrame(rows)
 
 def ddos_dest_flags(df_dest, min_flows=None, min_src_ips=None, max_window_sec=None):
+    """分散アクセス（DDoS着弾）の疑い：短時間に多数の異なる送信元が集中。"""
     p = dict(DDOS_DEST_RULE)
     p.update({k: v for k, v in dict(min_flows=min_flows, min_src_ips=min_src_ips,
-                                    max_window_sec=max_window_sec).items() if v is not None})
+                                     max_window_sec=max_window_sec).items() if v is not None})
     return ((df_dest["Observed_Flows"] >= p["min_flows"]) &
             (df_dest["Unique_Src_IPs"] >= p["min_src_ips"]) &
             (df_dest["Window_Sec"] <= p["max_window_sec"]))
@@ -98,6 +190,7 @@ def _epoch(x):
     return float(x)
 
 def flood_filters(row):
+    """フラッド（DoS）の疑いに対するフィルタ群。row は flood_flags==True の1行。"""
     src = row["Src_IP"]
     dst = row["Top_Dst_IP"]
     port = int(row["Top_Dst_Port"])
@@ -107,24 +200,23 @@ def flood_filters(row):
     duration = row["Block_Duration"]
     b_start = _epoch(row["Block_Start"])
     b_end = _epoch(row["Block_End"])
-    
     label1 = "① 送信元→宛先の全通信（" + str(n_flows) + "フロー）"
     label2 = "② 宛先ポート" + str(port) + "/" + proto + "に絞り込み"
     label3 = "③ 観測期間のみ（約" + format(duration, ".1f") + "秒間、" + format(rate, ".1f") + "フロー/秒）"
-    
     filters = {}
     filters[label1] = "ip.src==" + src + " && ip.dst==" + dst
     filters[label2] = "ip.src==" + src + " && ip.dst==" + dst + " && " + proto + ".port==" + str(port)
     filters[label3] = ("ip.src==" + src + " && ip.dst==" + dst +
                        " && frame.time_epoch>=" + format(b_start, ".0f") +
                        " && frame.time_epoch<=" + format(b_end, ".0f"))
-    
     if proto == "tcp":
         label4 = "④ SYNのみ（コネクション確立前の接続試行を抽出）"
         filters[label4] = "ip.src==" + src + " && ip.dst==" + dst + " && tcp.flags.syn==1 && tcp.flags.ack==0"
     return filters
 
 def ddos_dest_filters(row):
+    """分散アクセス（DDoS着弾）の疑いに対するフィルタ群。row は ddos_dest_flags==True の1行
+    （attach_top_src_ips 適用後、Top_Src_IPs が埋まっている前提）。"""
     dst = row["Dst_IP"]
     port = int(row["Dst_Port"])
     n_src = row["Unique_Src_IPs"]
@@ -132,22 +224,20 @@ def ddos_dest_filters(row):
     window_sec = row["Window_Sec"]
     b_start = _epoch(row["Block_Start"])
     b_end = _epoch(row["Block_End"])
-    
     label1 = "① 宛先への全通信（異なる送信元IP " + str(n_src) + "件・" + str(n_flows) + "フロー）"
     label2 = "② 観測期間のみ（約" + format(window_sec, ".1f") + "秒間に集中）"
     label3 = "③ 上位の送信元IP（最大5件、カンマ区切りを ||区切りに置換して使用）"
-    
     filters = {}
     filters[label1] = "ip.dst==" + dst + " && tcp.port==" + str(port) + " || ip.dst==" + dst + " && udp.port==" + str(port)
     filters[label2] = ("ip.dst==" + dst +
                        " && frame.time_epoch>=" + format(b_start, ".0f") +
                        " && frame.time_epoch<=" + format(b_end, ".0f"))
-    
     src_list = [ip for ip in row["Top_Src_IPs"].split(", ") if ip]
     filters[label3] = " || ".join("ip.src==" + ip for ip in src_list)
     return filters
 
 def reflection_filters(row):
+    """リフレクション/増幅の疑いに対するフィルタ群。row は reflection_flags==True の1行。"""
     src = row["Src_IP"]
     dst = row["Top_Dst_IP"]
     port = int(row["Top_Dst_Port"])
@@ -158,11 +248,9 @@ def reflection_filters(row):
     req_len = int(fwd_total) if fwd_total > 0 else 60
     b_start = _epoch(row["Block_Start"])
     b_end = _epoch(row["Block_End"])
-    
     label1 = "① 増幅ポート（" + port_name + "/" + str(port) + "）への全通信"
     label2 = "② 応答パケットのみ（増幅率 約" + format(amp, ".1f") + "倍、推定" + format(bwd_total, ".0f") + "バイト受信）"
     label3 = "③ 観測期間のみ"
-    
     filters = {}
     filters[label1] = "ip.addr==" + src + " && ip.addr==" + dst + " && udp.port==" + str(port)
     filters[label2] = ("ip.src==" + dst + " && ip.dst==" + src + " && udp.srcport==" + str(port) +
