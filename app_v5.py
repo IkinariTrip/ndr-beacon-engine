@@ -145,8 +145,8 @@ def correlate(attack_blocks, pairs_b):
         b = pd.DataFrame(columns=["ip", "B_level", "B_max_c2", "B_c2_peers"])
 
     m = a.merge(b, on="ip", how="outer")
-    in_a_scan = m["A_is_scan"].fillna(False)
-    in_a_other = m["A_is_other"].fillna(False)
+    in_a_scan = m["A_is_scan"].fillna(False).astype(bool)
+    in_a_other = m["A_is_other"].fillna(False).astype(bool)
     in_b = m["B_level"].notna()
     m["priority"] = np.select(
         [in_a_scan & in_b, in_b & (m["B_level"] == "CRITICAL"), in_b,
