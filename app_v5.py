@@ -195,6 +195,11 @@ if res:
     has_b = "B" in res
     if has_b:
         summary_b, blocks_b, stats_b = res["B"]
+        from src.engine_a.cross_check import mark_flood_matches
+        summary_b = mark_flood_matches(summary_b, attack_blocks)
+        n_flood_match = int(summary_b["a_flood_match"].sum()) if "a_flood_match" in summary_b.columns else 0
+        if n_flood_match:
+            st.info("エンジンAの「フラッドの疑い」と宛先が一致するC2判定の通信ペアが " + str(n_flood_match) + " 件あります。このうちCRITICALのものは、高頻度のDoSをC2と誤認した可能性があるため、WARNINGに引き下げて表示しています。")
         pairs_b, counts_b = triage_pairs(summary_b, stats_b)
     else:
         pairs_b, counts_b = pd.DataFrame(), {"CRITICAL": 0, "WARNING": 0, "SAFE": 0, "FILTERED": 0}
