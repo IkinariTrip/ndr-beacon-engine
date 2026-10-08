@@ -213,8 +213,8 @@ def flood_filters(row):
     filters[label1] = "ip.src==" + src + " && ip.dst==" + dst
     filters[label2] = "ip.src==" + src + " && ip.dst==" + dst + " && " + proto + ".port==" + str(port)
     filters[label3] = ("ip.src==" + src + " && ip.dst==" + dst +
-                       " && frame.time_epoch>=" + format(b_start, ".0f") +
-                       " && frame.time_epoch<=" + format(b_end, ".0f"))
+                       " && frame.time_epoch>=" + format(b_start - 0.001, ".3f") +
+                       " && frame.time_epoch<=" + format(b_end + 0.001, ".3f"))
     if proto == "tcp":
         label4 = "④ SYNのみ（コネクション確立前の接続試行を抽出）"
         filters[label4] = "ip.src==" + src + " && ip.dst==" + dst + " && tcp.flags.syn==1 && tcp.flags.ack==0"
@@ -236,8 +236,8 @@ def ddos_dest_filters(row):
     filters = {}
     filters[label1] = "ip.dst==" + dst + " && tcp.port==" + str(port) + " || ip.dst==" + dst + " && udp.port==" + str(port)
     filters[label2] = ("ip.dst==" + dst +
-                       " && frame.time_epoch>=" + format(b_start, ".0f") +
-                       " && frame.time_epoch<=" + format(b_end, ".0f"))
+                       " && frame.time_epoch>=" + format(b_start - 0.001, ".3f") +
+                       " && frame.time_epoch<=" + format(b_end + 0.001, ".3f"))
     src_list = [ip for ip in row["Top_Src_IPs"].split(", ") if ip]
     filters[label3] = " || ".join("ip.src==" + ip for ip in src_list)
     return filters
@@ -262,6 +262,6 @@ def reflection_filters(row):
     filters[label2] = ("ip.src==" + dst + " && ip.dst==" + src + " && udp.srcport==" + str(port) +
                        " && udp.length>=" + str(req_len))
     filters[label3] = ("ip.addr==" + src + " && ip.addr==" + dst +
-                       " && frame.time_epoch>=" + format(b_start, ".0f") +
-                       " && frame.time_epoch<=" + format(b_end, ".0f"))
+                       " && frame.time_epoch>=" + format(b_start - 0.001, ".3f") +
+                       " && frame.time_epoch<=" + format(b_end + 0.001, ".3f"))
     return filters

@@ -22,7 +22,7 @@ import streamlit as st
 from pathlib import Path as _Path
 from PIL import Image as _PILImage
 _APP_ICON_PATH = str(_Path(__file__).resolve().parent / "assets" / "incidence_cockpit_icon.png")
-st.set_page_config(page_title="Incidence Cockpit", page_icon=_PILImage.open(_APP_ICON_PATH), layout="wide")
+st.set_page_config(page_title="Incidence Cockpit 2606", page_icon=_PILImage.open(_APP_ICON_PATH), layout="wide")
 
 
 from src.flow_generator import extract_flows_from_pcap
@@ -45,7 +45,7 @@ _ic1, _ic2 = st.columns([1, 12])
 with _ic1:
     st.image(_APP_ICON_PATH, width=64)
 with _ic2:
-    st.title("Incidence Cockpit")
+    st.title("Incidence Cockpit 2606")
 st.caption("エンジンA：内部スキャン検知（縦：CatBoost v4／水平・その他：ルール）／"
            "エンジンB：外部C2ビーコン検知（CatBoost・タイミング5特徴量）")
 

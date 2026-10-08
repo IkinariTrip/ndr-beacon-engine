@@ -52,8 +52,8 @@ def base_wireshark_filters(host_ip, peer_ip, peer_port, proto, first_epoch, last
     filters = {}
     filters["① ペア全体"] = pair
     filters["② ペア＋ポート"] = with_port
-    filters["③ ペア＋観測期間"] = (with_port + " && frame.time_epoch >= " + format(first_epoch, ".0f") +
-                              " && frame.time_epoch <= " + format(last_epoch, ".0f"))
+    filters["③ ペア＋観測期間"] = (with_port + " && frame.time_epoch >= " + format(first_epoch - 0.001, ".3f") +
+                              " && frame.time_epoch <= " + format(last_epoch + 0.001, ".3f"))
     return filters
 
 def _c2_extra_filters(host_ip, peer_ip, peer_port, proto, iat_median, iat_mad, byte_ratio_median):

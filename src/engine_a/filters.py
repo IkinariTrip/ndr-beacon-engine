@@ -7,7 +7,7 @@ v5.7 の修正：
   ・水平スキャンの③：旧版は②と同じ意味の条件（SYNのみ）に、必ず成り立つ否定条件を
     付けただけで、「応答のない宛先」を絞り込めていなかった。表示フィルタでは「応答が
     無いこと」を直接書けないため、応答があった宛先（SYN+ACK）だけを出す形に変更した。
-    その件数が少ないほど、無応答率が高い（スキャンが空振りしている）ことを確認できる。
+    その件数が少ないほど、データ応答なし率が高い（スキャンが空振りしている）ことを確認できる。
   ・水平スキャンで、TCPの特徴（SYN）がないブロックはUDPとして扱うようにした。
 """
 
@@ -35,8 +35,8 @@ def vertical_filters(row):
     filters[label2] = "ip.src==" + src + " && ip.dst==" + dst
     filters[label3] = "ip.src==" + src + " && ip.dst==" + dst + " && tcp.flags.syn==1 && tcp.flags.ack==0"
     filters[label4] = ("ip.src==" + src +
-                       " && frame.time_epoch>=" + format(b_start, ".0f") +
-                       " && frame.time_epoch<=" + format(b_end, ".0f"))
+                       " && frame.time_epoch>=" + format(b_start - 0.001, ".3f") +
+                       " && frame.time_epoch<=" + format(b_end + 0.001, ".3f"))
     filters[label5] = "ip.src==" + dst + " && ip.dst==" + src + " && tcp.flags.reset==1"
     return filters
 
@@ -56,7 +56,7 @@ def horizontal_filters(row):
     filters[label1] = "ip.src==" + src
     if is_tcp:
         label2 = "② 主な宛先ポート" + str(port) + "/tcpへの接続試行（SYNのみ）"
-        label3 = ("③ 応答があった宛先のみ（SYN+ACK。無応答率 " + format(no_ret, ".2f") +
+        label3 = ("③ 応答があった宛先のみ（SYN+ACK。データ応答なし率 " + format(no_ret, ".2f") +
                   " のため、少数なら空振りのスキャン。多ければスキャンが成功した宛先なので要確認）")
         filters[label2] = ("ip.src==" + src + " && tcp.dstport==" + str(port) +
                            " && tcp.flags.syn==1 && tcp.flags.ack==0")
@@ -64,11 +64,11 @@ def horizontal_filters(row):
                            " && tcp.flags.syn==1 && tcp.flags.ack==1")
     else:
         label2 = "② 主な宛先ポート" + str(port) + "/udpへの送信"
-        label3 = ("③ 応答があった宛先のみ（宛先ポートからのUDP応答。無応答率 " + format(no_ret, ".2f") +
+        label3 = ("③ 応答があった宛先のみ（宛先ポートからのUDP応答。データ応答なし率 " + format(no_ret, ".2f") +
                   " のため、少数なら空振りのスキャン）")
         filters[label2] = "ip.src==" + src + " && udp.dstport==" + str(port)
         filters[label3] = "ip.dst==" + src + " && udp.srcport==" + str(port)
     filters[label4] = ("ip.src==" + src +
-                       " && frame.time_epoch>=" + format(b_start, ".0f") +
-                       " && frame.time_epoch<=" + format(b_end, ".0f"))
+                       " && frame.time_epoch>=" + format(b_start - 0.001, ".3f") +
+                       " && frame.time_epoch<=" + format(b_end + 0.001, ".3f"))
     return filters
