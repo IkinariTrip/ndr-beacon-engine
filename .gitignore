@@ -4,3 +4,12 @@ raw_pcap/
 *.pcap
 catboost_info/
 .DS_Store
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+raw_pcap/
+*.pcap
+*.pcapng
+*.log
+*.log.labeled

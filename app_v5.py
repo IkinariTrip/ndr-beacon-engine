@@ -191,6 +191,15 @@ def _dash_table(df):
             out[c] = s.map(lambda v: "―" if (pd.isna(v) or str(v).strip() == "" or str(v) == "None") else str(v))
     return out
 
+def csv_download(label, df, filename, key):
+    if df is None or len(df) == 0:
+        return
+    state_key = "csv" + key
+    if st.button("📥 " + label + "のCSVを作成", key="mk_" + key):
+        st.session_state[state_key] = df.to_csv(index=False).encode("utf-8-sig")
+    if state_key in st.session_state:
+        st.download_button("⬇ " + label + "をダウンロード", st.session_state[state_key], file_name=filename, mime="text/csv", key="dl_" + key)
+
 uploaded_file = st.file_uploader("解析対象のパケットキャプチャ (PCAP / PCAPNG) を選択", type=["pcap", "pcapng"])
 
 if uploaded_file is not None:
@@ -212,6 +221,8 @@ if uploaded_file is not None:
             if os.path.exists(tmp_pcap_path):
                 os.remove(tmp_pcap_path)
         st.session_state["result"] = result
+        for _k in [k for k in st.session_state.keys() if str(k).startswith("csv")]:
+            del st.session_state[_k]
 
 res = st.session_state.get("result")
 if res:
@@ -267,6 +278,7 @@ if res:
         show_cols = corr[corr["priority"] != ""]
         if len(show_cols):
             show = show_cols[["priority", "ip", "A_type", "A_blocks", "A_ports", "B_level", "B_max_c2", "B_c2_peers"]]
+            csv_download("統合判定の表", show, "integrated_" + res["name"] + ".csv", "integrated")
             st.dataframe(show.rename(columns={
                 "priority": "優先度", "ip": "端末IP", "A_type": "A：種別", "A_blocks": "A：該当ブロック数",
                 "A_ports": "A：主な宛先ポート", "B_level": "B：区分", "B_max_c2": "B：最大C2確率",
@@ -288,6 +300,7 @@ if res:
             col2.metric("生成フロー数", f"{len(df_flows):,} の流れ")
             col3.metric("縦スキャン", f"{int(df_agg['Vertical'].sum()):,} ブロック")
             col4.metric("水平スキャン", f"{int(df_agg['Horizontal'].sum()):,} ブロック")
+            csv_download("エンジンAの検知ブロック", attack_blocks, "engineA_hits_" + res["name"] + ".csv", "a_hits")
             col5.metric("その他攻撃の疑い", f"{int(df_agg['Is_Other'].sum()):,} ブロック")
 
             st.markdown("---")
@@ -368,6 +381,7 @@ if res:
     # ================= エンジンB =================
     with tab_b:
         if has_b:
+            csv_download("エンジンBの通信ペア", pairs_b.drop(columns=[c for c in ("filters",) if c in pairs_b.columns]), "engineB_pairs_" + res["name"] + ".csv", "b_pairs")
             render_engine_b_results(summary_b, blocks_b, stats_b, ENGINE_B_MODEL, res["name"])
         else:
             st.error(f"エンジンBの解析に失敗しました：{res.get('B_error', '不明')}")
